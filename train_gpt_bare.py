@@ -29,6 +29,15 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+CONTROL_TENSOR_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "CONTROL_TENSOR_NAME_PATTERNS",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+    ).split(",")
+    if pattern
+)
+
 # ==============================================================================
 # HYPERPARAMETERS
 # ==============================================================================
@@ -193,11 +202,11 @@ class VanillaMultiHeadAttention(nn.Module):
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        # TODO: consider fused QKV: nn.Linear(dim, 3 * dim, bias=False)
-        self.c_q = nn.Linear(dim, dim, bias=False) # self.num_heads * self.head_dim
-        self.c_k = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
-        self.c_v = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
-        self.proj = nn.Linear(dim, dim, bias=False)
+        # TODO: consider fused QKV: CastedLinear(dim, 3 * dim, bias=False)
+        self.c_q = CastedLinear(dim, dim, bias=False) # self.num_heads * self.head_dim
+        self.c_k = CastedLinear(dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.c_v = CastedLinear(dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
@@ -253,8 +262,8 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = dim * mlp_mult
-        self.fc = nn.Linear(dim, hidden, bias=False)
-        self.proj = nn.Linear(hidden, dim, bias=False)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.proj(F.relu(self.fc(x)))
@@ -306,7 +315,7 @@ class GPT(nn.Module):
         self.pos_emb = SinusoidalEmbedding(max_seq_len, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_mult) for _ in range(num_layers)])
         self.final_norm = LayerNormNoWeight()
-        self.lm_head = None if tie_embeddings else nn.Linear(model_dim, vocab_size, bias=False)
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -421,7 +430,8 @@ def eval_val(
             x = local[:-1].reshape(-1, args.train_seq_len)
             y = local[1:].reshape(-1, args.train_seq_len)
             # TODO: re-enable bfloat16 autocast for faster evaluation
-            batch_loss = model(x, y).detach()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                batch_loss = model(x, y).detach()
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -551,6 +561,18 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
+class CastedLinear(nn.Linear):
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def forward(self, x: Tensor) -> Tensor:
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
+    # Keep small/control parameters in fp32 even when the model body runs in bf16.
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
 
 # ==============================================================================
 # MAIN
@@ -643,8 +665,12 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         max_seq_len=args.train_seq_len,
         tie_embeddings=args.tie_embeddings,
-    ).to(device)
-    # TODO: cast to bfloat16 + use CastedLinear to keep weights in fp32 (see train_gpt.py)
+    ).to(device=device, dtype=torch.bfloat16)
+    # restore CastedLinear to fp32
+    for module in base_model.modules():
+        if isinstance(module, CastedLinear):
+            module.float()
+    restore_low_dim_params_to_fp32(base_model)
     # TODO: use torch.compile(base_model, dynamic=False, fullgraph=True) for speed
     model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else base_model
 
@@ -693,7 +719,8 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1  # type: ignore[union-attr]
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                warmup_loss = model(x, y)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             opt.step()
             opt.zero_grad()
@@ -747,7 +774,8 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             # TODO: re-enable bfloat16 autocast for faster training:
             #   with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            loss = model(x, y)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
