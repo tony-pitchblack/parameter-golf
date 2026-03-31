@@ -185,59 +185,63 @@ class SinusoidalEmbedding(nn.Module):
 # ==============================================================================
 
 class VanillaMultiHeadAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int | None = None):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         # TODO: consider fused QKV: nn.Linear(dim, 3 * dim, bias=False)
-        self.c_q = nn.Linear(dim, dim, bias=False)
-        self.c_k = nn.Linear(dim, dim, bias=False)
-        self.c_v = nn.Linear(dim, dim, bias=False)
+        self.c_q = nn.Linear(dim, dim, bias=False) # self.num_heads * self.head_dim
+        self.c_k = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.c_v = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
         self.proj = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
         B, T, _ = x.shape
-        # TODO 1: project to Q, K, V — q = self.c_q(x), k = self.c_k(x), v = self.c_v(x)  # (B, T, dim)
+        # Project to Q, K, V
         Q, K, V = self.c_q(x), self.c_k(x), self.c_v(x)
 
-        # TODO 2: split heads — reshape each to (B, T, num_heads, head_dim), then transpose to (B, num_heads, T, head_dim)
-
+        # Split heads — reshape each to (B, T, num_heads, head_dim), then transpose to (B, num_heads, T, head_dim)
+        # TODO: add GQA (grouped query attention) — use fewer KV heads than Q heads to reduce memory
+        #       e.g., num_kv_heads < num_heads, with each KV head shared across num_heads // num_kv_heads Q heads
         Q = Q.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        K = K.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        K = K.reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        V = V.reshape(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
-        # # TODO 3: attention scores — scores = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, T, T)
+        # # Expand KV heads if using GQA (this is cheap compared to MM above)
+        # if self.num_kv_heads < self.num_heads:
+        #     n_rep = self.num_heads // self.num_kv_heads
+        #     K = K.repeat_interleave(n_rep, dim=1)
+        #     V = V.repeat_interleave(n_rep, dim=1)
+
+        # # Attention scores
         # scores = Q @ K.transpose(-2, -1) * self.scale
 
-        # # TODO 4: causal mask — set scores[:, :, i, j] = -inf for all j > i (upper triangle)
-        # # Create causal mask: upper triangle (j > i) should be -inf
+        # # Causal mask — set scores[:, :, i, j] = -inf for all j > i (upper triangle)
         # mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        # scores = scores.masked_fill(mask, float('-inf')) # [B, num_heads, T, T] logits
+        # scores = scores.masked_fill(mask, float('-inf'))
 
-        # # TODO 5: attention weights — weights = scores.softmax(dim=-1)
-        # weights = scores.softmax(dim=-1) # [B, num_heads, T, T] probs
+        # # Attention weights
+        # weights = scores.softmax(dim=-1)
 
-        # # TODO 6: context — ctx = weights @ v  # (B, num_heads, T, head_dim)
-        # ctx = weights @ V # [B, num_heads, T, head_dim]
+        # # Context
+        # ctx = weights @ V
 
-        # TODO 3-6 (alternative): flash attention
+        # Alternative: use flash attention for fused, memory-efficient implementation
         ctx = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
-        # TODO 7: merge heads — ctx.transpose(1, 2).contiguous().reshape(B, T, -1)
-        ctx = ctx.transpose(1, 2).contiguous() # [B, num_heads, T, head_dim] -> [B, T, num_heads, head_dim]
-        ctx = ctx.reshape(B, T, -1) # [B, T, dim]
+        # Merge heads
+        ctx = ctx.transpose(1, 2).contiguous().reshape(B, T, -1)
 
-        # TODO 8: output projection — return self.proj(ctx)
+        # Output projection
         out = self.proj(ctx)
 
-        # TODO (later): add QK normalization (F.rms_norm on q and k) to stabilize training
-        # TODO (later): add GQA (grouped query attention) to reduce KV memory
+        # TODO: add QK normalization (F.rms_norm on Q and K) to stabilize training
 
         return out
-
 
 # ==============================================================================
 # MLP
