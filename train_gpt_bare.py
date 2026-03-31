@@ -209,19 +209,22 @@ class VanillaMultiHeadAttention(nn.Module):
         K = K.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # TODO 3: attention scores — scores = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, T, T)
-        scores = Q @ K.transpose(-2, -1) * self.scale
+        # # TODO 3: attention scores — scores = (q @ k.transpose(-2, -1)) * self.scale  # (B, num_heads, T, T)
+        # scores = Q @ K.transpose(-2, -1) * self.scale
 
-        # TODO 4: causal mask — set scores[:, :, i, j] = -inf for all j > i (upper triangle)
-        # Create causal mask: upper triangle (j > i) should be -inf
-        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask, float('-inf')) # [B, num_heads, T, T] logits
+        # # TODO 4: causal mask — set scores[:, :, i, j] = -inf for all j > i (upper triangle)
+        # # Create causal mask: upper triangle (j > i) should be -inf
+        # mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+        # scores = scores.masked_fill(mask, float('-inf')) # [B, num_heads, T, T] logits
 
-        # TODO 5: attention weights — weights = scores.softmax(dim=-1)
-        weights = scores.softmax(dim=-1) # [B, num_heads, T, T] probs
+        # # TODO 5: attention weights — weights = scores.softmax(dim=-1)
+        # weights = scores.softmax(dim=-1) # [B, num_heads, T, T] probs
 
-        # TODO 6: context — ctx = weights @ v  # (B, num_heads, T, head_dim)
-        ctx = weights @ V # [B, num_heads, T, head_dim]
+        # # TODO 6: context — ctx = weights @ v  # (B, num_heads, T, head_dim)
+        # ctx = weights @ V # [B, num_heads, T, head_dim]
+
+        # TODO 3-6 (alternative): flash attention
+        ctx = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
         # TODO 7: merge heads — ctx.transpose(1, 2).contiguous().reshape(B, T, -1)
         ctx = ctx.transpose(1, 2).contiguous() # [B, num_heads, T, head_dim] -> [B, T, num_heads, head_dim]
@@ -230,7 +233,6 @@ class VanillaMultiHeadAttention(nn.Module):
         # TODO 8: output projection — return self.proj(ctx)
         out = self.proj(ctx)
 
-        # TODO (later): replace steps 3-6 with F.scaled_dot_product_attention for FlashAttention
         # TODO (later): add QK normalization (F.rms_norm on q and k) to stabilize training
         # TODO (later): add GQA (grouped query attention) to reduce KV memory
 
